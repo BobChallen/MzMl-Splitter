@@ -7,7 +7,7 @@ from PyQt6.QtCore import pyqtSlot, Qt, pyqtSignal
 from PyQt6.QtWidgets import *
 from PyQt6.uic import loadUi
 from PySide6 import QtCore, QtGui
-from Splitting_UI_mod import Ui_MainWindow
+from Splitting_UI_modv2 import Ui_MainWindow
 from pyopenms import *
 from pyopenms import ChromatogramExtractorAlgorithm, ChromatogramExtractor, OSChromatogram
 import numpy as np
@@ -45,11 +45,12 @@ class MainWindow(QMainWindow):
         self.starting_scan = 1
         self.ui.pushButton.clicked.connect(self.file_finder)
         self.ui.output_button.clicked.connect(self.output_finder)
-        self.ui.go_button.clicked.connect(self.scans_per_timepoint)     
-        
+        self.ui.go_button.clicked.connect(self.scans_per_timepoint) 
+        self.ui.substrate_spinbox.editingFinished.connect(self.substrate_mz)
+        self.ui.product_spinbox.editingFinished.connect(self.product_mz)    
+        self.ui.IS_spinbox.editingFinished.connect(self.is_mz)
+        self.ui.IS_checkBox.stateChanged.connect(self.is_normalisation)        
         self.show()
-
-    # user input for file path
 
     def file_finder(self):
         #User input for input file location - must be mzml currently
@@ -58,7 +59,6 @@ class MainWindow(QMainWindow):
 
         if selected_file_path:
             self.ui.selectFileLineEdit.setText(selected_file_path)
-
 
     def output_finder(self):
         #user input for output file location - recommend a new folder for each processing job due to the number of files created.
@@ -73,11 +73,12 @@ class MainWindow(QMainWindow):
         #user input for the starting scan from the GUI.
         #might be nice to have an image window pop-up with the chromatogram for the user to see the outline without having to go into masslynx
         self.starting_scan = self.ui.selectStartScanSpinBox.value()
-        print(self.starting_scan)
+        print("Processing from scan",self.starting_scan)
 
     def sum_scans(self):
         #takes the user input from the UI as to how many scans to sum per timepoint, and sends the value to the worker thread
         self.scans_to_sum = self.ui.doubleSpinBox.value()
+        print("Will sum", self.scans_to_sum, "scans for each timepoint")
 
     def scans_per_timepoint(self):        
         #sends the value and progress bar management to the worker thread
@@ -89,16 +90,38 @@ class MainWindow(QMainWindow):
     def worker_finished(self):
             #Prints completion method once the worker thread has finished
             print("Processing complete!") 
-            self.ui.progressBar.setRange(0,100)           
-            
+            self.ui.progressBar.setRange(0,100)      
+
+    def substrate_mz(self):
+        self.SUBSTRATE_MZ = self.ui.substrate_spinbox.value()
+        print("Substrate m/z:", self.SUBSTRATE_MZ)
     
+    def product_mz(self):
+        self.PRODUCT_MZ = self.ui.product_spinbox.value()
+        print("Product m/z:", self.PRODUCT_MZ)
+            
+    def is_mz(self):
+        self.IS_MZ = self.ui.IS_spinbox.value()
+        print("Internal Standard m/z:", self.IS_MZ)
+
+    def is_normalisation(self):
+        print("test")
+
     def update_progress_bar(self, value):
         self.ui.progressBar.setValue(value)
     
+    def extract_intensity(self, spectrum, mz_value):
+        #Peak pick for closest peak to desired m/z value
+        closest_peak = min(spectrum, key=lambda x: abs(x.getMZ() - mz_value))
+        #return intensity of the closest peak
+        return closest_peak.getIntensity()
+
     def split_file(self, scans_to_sum, bin_width=0.5):
         # Get the input file path from the GUI
         input_file_path = self.ui.selectFileLineEdit.text()
 
+        #create a list to store all extracted intensities
+        all_df_list = []
         # Specify the output directory for the split files
         output_directory = self.selected_directory
         os.makedirs(output_directory, exist_ok=True)
@@ -125,10 +148,30 @@ class MainWindow(QMainWindow):
             print("Start Spectrum Index:", start_spectrum_index)
             print("End Spectrum Index:", end_spectrum_index)
 
+            #create a list with user defined m/z values to look for
+            #add an internal standard if the 'IS used' box on the GUI is checked
+            if self.ui.IS_checkBox.isChecked:
+                mz_values_of_interest = [self.SUBSTRATE_MZ, self.PRODUCT_MZ, self.IS_MZ]
+            else:
+                mz_values_of_interest = [self.SUBSTRATE_MZ, self.PRODUCT_MZ]
+
+            #create a dataframe to store the intensity values
+            df_list = []
+
             for i in range(start_spectrum_index, end_spectrum_index):
                 # Get the current spectrum
                 current_spectrum = exp.getSpectra()[i]
 
+                'Extract the intensity values for the desired peaks'
+                intensity_values = []
+                for mz_value in mz_values_of_interest:
+                    intensity = self.extract_intensity(current_spectrum, mz_value)
+                    intensity_values.append(intensity)
+                
+                #Extract scan information
+                scan_number = i +1
+                scan_df = pd.DataFrame([{'Scan': scan_number, **dict(zip(mz_values_of_interest, intensity_values))}])
+                df_list.append(scan_df)
                 # Add the current spectrum to the new MSExperiment
                 new_exp.addSpectrum(current_spectrum)
 
@@ -158,9 +201,65 @@ class MainWindow(QMainWindow):
             MzMLFile().store(output_file_name, new_exp)
             value = int(((current_output_file_index/total_files)*100)//2)
             self.worker_thread.progress_update.emit(value)
-            # Increment the indices
+           
+           # Increment the indices
             current_spectrum_index = end_spectrum_index
             current_output_file_index += 1
+           
+            #append extracted m/z intensity list to master list
+            all_df_list.append(df_list)
+        
+        #concat all intensity lists and export to .xlsx file
+        intensity_df = pd.concat([pd.concat(df_list) for df_list in all_df_list], ignore_index=True)
+
+        #normalise the intensity of the product and substrate by the intensity of the internal standard
+        intensity_df['NORM_SUBSTRATE_MZ'] = (intensity_df[self.SUBSTRATE_MZ]/intensity_df[self.IS_MZ])
+        intensity_df['NORM_PRODUCT_MZ'] = (intensity_df[self.PRODUCT_MZ]/intensity_df[self.IS_MZ])
+        
+        #calculate the conversion % of substrate to product
+        intensity_df['Conversion%'] = (intensity_df['NORM_PRODUCT_MZ']/(intensity_df['NORM_SUBSTRATE_MZ']+intensity_df['NORM_PRODUCT_MZ'])*100)
+
+        #create a new dataframe with averaged data to smooth the data
+        averaged_df_list = []
+        averaged_df = pd.DataFrame(columns=intensity_df.columns)
+        
+
+        # #iterate over averaged data to calculate mean 
+        grouped_df = intensity_df.groupby(np.arange(len(intensity_df))//self.scans_to_sum).mean()
+        averaged_df_list.append(grouped_df)
+
+        #concat the averaged list into one dataframe
+        averaged_df = pd.concat(averaged_df_list, ignore_index=True)
+        averaged_df['Conversion% Standard Deviation'] = intensity_df.groupby(np.arange(len(intensity_df)) // self.scans_to_sum)['Conversion%'].std()
+        
+        #rename the columns for averaged and extracted intenisites csv's to make the ouput easier to read
+        averaged_df2 = averaged_df.rename({
+            self.SUBSTRATE_MZ: 'Substrate Intensity', 
+            self.PRODUCT_MZ: 'Product Intensity', 
+            'NORM_SUBSTRATE_MZ': 'Normalised Substrate Intensity', 
+            'NORM_PRODUCT_MZ':'Normalised Product Intensity',
+            self.IS_MZ:'Internal Standard Intensity',
+            }, 
+            axis='columns')
+        intensity_df2 = averaged_df.rename({
+            self.SUBSTRATE_MZ: 'Substrate Intensity', 
+            self.PRODUCT_MZ: 'Product Intensity', 
+            'NORM_SUBSTRATE_MZ': 'Normalised Substrate Intensity', 
+            'NORM_PRODUCT_MZ':'Normalised Product Intensity',
+            self.IS_MZ:'Internal Standard Intensity',
+            }, 
+            axis='columns')
+        averaged_filepath = os.path.join(output_directory, "averaged intensities.csv")
+        averaged_df2.to_csv(averaged_filepath, index=False)
+
+       
+        #determine output directory for the extracted csv (same as user selected output path)
+        extracted_filepath = os.path.join(output_directory, "extracted intensities.csv")
+       
+        #create new .csv file` `
+        intensity_df2.to_csv(extracted_filepath, index=False)
+       
+        #run through list of created mzml files and run the bin_spectra script on them
         for filename in os.listdir(output_directory):
             if filename.endswith(".mzML"):
                 file_path = os.path.join(output_directory, filename)
@@ -168,35 +267,45 @@ class MainWindow(QMainWindow):
                 value = int(((current_output_file_index/total_files*100)//2))
                 self.worker_thread.progress_update.emit(value)
 
-        # Sort the list alphabetically
+        # Sort the list alphabetically so that the final output is in ascending order
         excel_files = glob(os.path.join(output_directory, "*.xlsx"))
         for file in excel_files:
             if '~$' in file:
-                continue
+                continue #bug fix for temp files causing the script to error out due to being unable to access the temp file
             else:
                 print("Normalising summed intensity data of", file)
+               
                 # load to pandas data frame
                 workbook = pd.read_excel(file)
+                
                 # normalise second column (counts) by dividing value by max value
                 df_max_scaled = workbook.copy()
+               
                 # df_max_scaled['counts'] = df_max_scaled['counts'] / df_max_scaled['counts'].max()
                 # rename counts column to filename
                 df_max_scaled.rename(columns={'counts': file}, inplace=True)
+               
                 # save dataframe back to excel
                 df_max_scaled.to_excel(file + "normalised.xlsx", index=False)
+       
         # Load only excel files with normalised data into variable
         norm_list = glob(output_directory + "/*normalised.xlsx")
+       
         # Tranpose the data in each excel file (row 1 = m/z, row 2 = intensity)
         st = ScriptTime()
         st.printstart()
         for file in norm_list:
             print("Transposing data of", file)
+           
             # load workbook to dataframe
             df = pd.read_excel(file, index_col=0)
+           
             # transpose data
             df_transposed = df.transpose()
+            
             # save the updated workbook to a new file
             df_transposed.to_excel(file + "transposed_output.xlsx")
+       
         # load only excel files with transposed data into variable
         merged_list = glob(output_directory + "/*transposed_output.xlsx")
         df = pd.DataFrame()
@@ -216,7 +325,7 @@ class MainWindow(QMainWindow):
         # gather all now unnecessary file paths into a list
         print("Deleting unnecessary files")
         # delete all unnecessary files (i.e intermediary excel files, mzML files)
-        # comment out below lines to keep files instead
+        # alter lines as necessary to customise which files to keep
         files_to_delete = glob(output_directory + "/*.mzml.xlsx") + glob(output_directory + "/*.mzml.xlsxnormalised.xlsx") + \
             glob(output_directory + "/*.mzml.xlsxnormalised.xlsxtransposed_output.xlsx") + \
             glob(output_directory + "/*.mzML.gz")
